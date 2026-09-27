@@ -1,0 +1,7 @@
+services:
+  vanta:
+    build: .
+    container_name: vanta-status
+    ports:
+      - "8081:80"
+    restart: unless-stopped
