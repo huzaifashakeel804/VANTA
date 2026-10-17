@@ -4,4 +4,9 @@ services:
     container_name: vanta-status
     ports:
       - "8081:80"
+    volumes:
+      - vanta-data:/data
     restart: unless-stopped
+
+volumes:
+  vanta-data:
