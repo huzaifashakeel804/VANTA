@@ -4,6 +4,8 @@ services:
     container_name: vanta-status
     ports:
       - "8081:80"
+    environment:
+      ADMIN_TOKEN: ${VANTA_ADMIN_TOKEN:?Set VANTA_ADMIN_TOKEN to a random value of at least 24 characters}
     volumes:
       - vanta-data:/data
     restart: unless-stopped

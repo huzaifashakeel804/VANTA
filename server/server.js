@@ -1,10 +1,19 @@
 const path = require('node:path');
 const fs = require('node:fs');
+const dns = require('node:dns').promises;
+const net = require('node:net');
+const crypto = require('node:crypto');
 const express = require('express');
 const Database = require('better-sqlite3');
 
 const app = express();
 const port = Number(process.env.PORT) || 80;
+const adminToken = process.env.ADMIN_TOKEN;
+if (!adminToken || adminToken.length < 24) throw new Error('ADMIN_TOKEN must be set to a random value of at least 24 characters.');
+const maxMonitors = 100;
+const createWindowMs = 60 * 60 * 1000;
+const createLimit = 10;
+const createAttempts = new Map();
 const dataDir = process.env.DATA_DIR || path.join(__dirname, 'data');
 fs.mkdirSync(dataDir, { recursive: true });
 const db = new Database(path.join(dataDir, 'vanta.sqlite'));
@@ -27,6 +36,64 @@ function validHttpUrl(value) {
   } catch { return false; }
 }
 
+function isPublicAddress(address) {
+  const version = net.isIP(address);
+  if (version === 4) {
+    const octets = address.split('.').map(Number);
+    const [a, b] = octets;
+    return !(a === 0 || a === 10 || a === 127 || a >= 224 ||
+      (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) ||
+      (a === 192 && b === 0) || (a === 198 && (b === 18 || b === 19)) ||
+      (a === 198 && b === 51) || (a === 203 && b === 0));
+  }
+  if (version === 6) {
+    const normalized = address.toLowerCase();
+    return normalized === '::1' || normalized === '::' ? false :
+      !(normalized.startsWith('fc') || normalized.startsWith('fd') ||
+        normalized.startsWith('fe8') || normalized.startsWith('fe9') ||
+        normalized.startsWith('fea') || normalized.startsWith('feb') ||
+        normalized.startsWith('ff') || normalized.startsWith('2001:db8:') ||
+        normalized.startsWith('::ffff:'));
+  }
+  return false;
+}
+
+async function validatePublicTarget(value) {
+  let url;
+  try { url = new URL(value); } catch { return false; }
+  if (!validHttpUrl(value) || url.username || url.password) return false;
+  const hostname = url.hostname.toLowerCase().replace(/\.$/, '');
+  if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local')) return false;
+  const literalVersion = net.isIP(hostname);
+  if (literalVersion) return isPublicAddress(hostname);
+  try {
+    const addresses = await dns.lookup(hostname, { all: true, verbatim: true });
+    return addresses.length > 0 && addresses.every(({ address }) => isPublicAddress(address));
+  } catch { return false; }
+}
+
+function requireAdmin(req, res, next) {
+  const supplied = req.get('authorization') || '';
+  const token = supplied.startsWith('Bearer ') ? supplied.slice(7) : '';
+  const tokenBuffer = Buffer.from(token);
+  const adminBuffer = Buffer.from(adminToken);
+  if (tokenBuffer.length !== adminBuffer.length || !crypto.timingSafeEqual(tokenBuffer, adminBuffer)) {
+    return res.status(401).json({ error: 'Enter the monitoring access token.' });
+  }
+  next();
+}
+
+function limitMonitorCreates(req, res, next) {
+  const now = Date.now();
+  const key = req.ip;
+  const recent = (createAttempts.get(key) || []).filter(timestamp => now - timestamp < createWindowMs);
+  if (recent.length >= createLimit) return res.status(429).json({ error: 'Monitor creation limit reached. Try again later.' });
+  recent.push(now);
+  createAttempts.set(key, recent);
+  next();
+}
+
 function validDiscordWebhook(value) {
   try {
     const url = new URL(value);
@@ -36,7 +103,9 @@ function validDiscordWebhook(value) {
   } catch { return false; }
 }
 
-app.post('/api/monitors', (req, res) => {
+app.use('/api', requireAdmin);
+
+app.post('/api/monitors', limitMonitorCreates, async (req, res) => {
   const { url, discordWebhookUrl } = req.body || {};
   if (typeof url !== 'string' || !url.trim() || typeof discordWebhookUrl !== 'string' || !discordWebhookUrl.trim()) {
     return res.status(400).json({ error: 'URL and Discord webhook URL are required.' });
@@ -44,8 +113,12 @@ app.post('/api/monitors', (req, res) => {
   const cleanUrl = url.trim();
   const cleanWebhook = discordWebhookUrl.trim();
   if (!validHttpUrl(cleanUrl)) return res.status(400).json({ error: 'Enter a valid http or https URL.' });
+  if (!await validatePublicTarget(cleanUrl)) return res.status(400).json({ error: 'Monitor URL must resolve only to a public internet address.' });
   if (!validDiscordWebhook(cleanWebhook)) return res.status(400).json({ error: 'Enter a valid Discord webhook URL.' });
   try {
+    if (db.prepare('SELECT COUNT(*) AS count FROM monitors').get().count >= maxMonitors) {
+      return res.status(409).json({ error: `The monitor limit of ${maxMonitors} has been reached.` });
+    }
     const result = db.prepare('INSERT INTO monitors (url, discord_webhook_url) VALUES (?, ?)').run(cleanUrl, cleanWebhook);
     return res.status(201).json(db.prepare('SELECT id, url, last_status, last_checked_at, created_at FROM monitors WHERE id = ?').get(result.lastInsertRowid));
   } catch (error) {
@@ -83,9 +156,21 @@ app.get('*', (_req, res) => res.sendFile(path.join(__dirname, '..', 'index.html'
 async function checkMonitor(monitor) {
   let status = 'down';
   try {
-    const response = await fetch(monitor.url, { redirect: 'follow', signal: AbortSignal.timeout(10000) });
-    if (response.status >= 200 && response.status < 400) status = 'up';
-    if (response.body) await response.body.cancel().catch(() => {});
+    let target = monitor.url;
+    for (let redirects = 0; redirects <= 5; redirects++) {
+      if (!await validatePublicTarget(target)) throw new Error('Target is not public.');
+      const response = await fetch(target, { redirect: 'manual', signal: AbortSignal.timeout(10000) });
+      if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
+        const nextTarget = new URL(response.headers.get('location'), target).href;
+        if (response.body) await response.body.cancel().catch(() => {});
+        if (redirects === 5) throw new Error('Too many redirects.');
+        target = nextTarget;
+        continue;
+      }
+      status = response.status >= 200 && response.status < 400 ? 'up' : 'down';
+      if (response.body) await response.body.cancel().catch(() => {});
+      break;
+    }
   } catch { /* Network errors and timeouts count as down. */ }
 
   const checkedAt = new Date().toISOString();
